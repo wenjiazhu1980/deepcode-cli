@@ -66,6 +66,7 @@ const PROJECT_CODE_HASH_LENGTH = 16;
 const BACKGROUND_FAILURE_LOG_TAIL_CHARS = 4000;
 const DEFAULT_COMPACT_PROMPT_TOKEN_THRESHOLD = 128 * 1024;
 const DEEPSEEK_V4_COMPACT_PROMPT_TOKEN_THRESHOLD = 512 * 1024;
+const PLAN_MODE_STATUS_MESSAGE = "/plan\n  └ Set Plan Mode on. Awaiting <proposed_plan>.";
 
 type ChatCompletionDebugOptions = {
   enabled?: boolean;
@@ -288,6 +289,7 @@ export type SkillInfo = {
   path: string;
   description: string;
   isLoaded?: boolean;
+  allowImplicitInvocation?: boolean;
 };
 
 type SessionManagerOptions = {
@@ -298,6 +300,7 @@ type SessionManagerOptions = {
     webSearchTool?: string;
     mcpServers?: Record<string, McpServerConfig>;
     permissions?: Required<PermissionSettings>;
+    enabledSkills?: Record<string, boolean>;
   };
   renderMarkdown: (text: string) => string;
   onAssistantMessage: (message: SessionMessage, shouldConnect: boolean) => void;
@@ -324,6 +327,7 @@ export class SessionManager {
     webSearchTool?: string;
     mcpServers?: Record<string, McpServerConfig>;
     permissions?: Required<PermissionSettings>;
+    enabledSkills?: Record<string, boolean>;
   };
   private readonly onAssistantMessage: (message: SessionMessage, shouldConnect: boolean) => void;
   private readonly onSessionEntryUpdated?: (entry: SessionEntry) => void;
@@ -729,13 +733,14 @@ Response in JSON format:
 If none of the available skills match, respond with an empty array, i.e. \`{"skillNames": []}\`.\n
 `;
     const simpleSkills = skills
-      .filter((x) => !x.isLoaded)
+      .filter((x) => !x.isLoaded && x.allowImplicitInvocation !== false)
       .map((x) => {
         return { name: x.name, description: x.description };
       });
     if (simpleSkills.length === 0) {
       return [];
     }
+    const candidateSkillNames = new Set(simpleSkills.map((skill) => skill.name));
 
     const { client, model, baseURL, debugLogEnabled } = this.createOpenAIClient();
     if (!client) {
@@ -784,7 +789,10 @@ ${agentInstructions}
 
       const parsed = JSON.parse(content);
       if (parsed && Array.isArray(parsed.skillNames)) {
-        return parsed.skillNames;
+        return parsed.skillNames.filter(
+          (skillName: unknown): skillName is string =>
+            typeof skillName === "string" && candidateSkillNames.has(skillName)
+        );
       }
 
       return [];
@@ -803,11 +811,25 @@ ${agentInstructions}
       { root: path.join(this.projectRoot, ".agents", "skills"), displayRoot: "./.agents/skills" },
       { root: path.join(homeDir, ".deepcode", "skills"), displayRoot: "~/.deepcode/skills" },
       { root: path.join(homeDir, ".agents", "skills"), displayRoot: "~/.agents/skills" },
+      { root: this.getBundledSkillsRoot(), displayRoot: "bundled:" },
     ];
+  }
+
+  private getBundledSkillsRoot(): string {
+    const extensionRoot = getExtensionRoot();
+    const sourceRoot = path.join(extensionRoot, "templates", "skills", "bundled");
+    const distRoot = path.join(extensionRoot, "dist", "bundled");
+
+    // Source check keeps local development/tests on the checked-in templates.
+    if (fs.existsSync(path.join(extensionRoot, "src", "session.ts")) && fs.existsSync(sourceRoot)) {
+      return sourceRoot;
+    }
+    return fs.existsSync(distRoot) ? distRoot : sourceRoot;
   }
 
   async listSkills(sessionId?: string): Promise<SkillInfo[]> {
     const skillRoots = this.getSkillScanRoots();
+    const enabledSkills = this.getResolvedSettings().enabledSkills ?? {};
     const skillsByName = new Map<string, SkillInfo>();
 
     const collectSkills = (root: string, displayRoot: string): SkillInfo[] => {
@@ -839,7 +861,13 @@ ${agentInstructions}
         } catch {
           continue;
         }
-        results.push(this.readSkillInfo(skillPath, `${displayRoot}/${skillName}/SKILL.md`, skillName));
+        const displayPath =
+          displayRoot === "bundled:" ? `bundled:${skillName}/SKILL.md` : `${displayRoot}/${skillName}/SKILL.md`;
+        const skill = this.readSkillInfo(skillPath, displayPath, skillName);
+        if (enabledSkills[skill.name] === false) {
+          continue;
+        }
+        results.push(skill);
       }
       return results;
     };
@@ -865,6 +893,16 @@ ${agentInstructions}
   }
 
   private resolveSkillPath(skillPath: string): string {
+    if (skillPath.startsWith("bundled:")) {
+      const relativePath = skillPath.slice("bundled:".length);
+      const root = this.getBundledSkillsRoot();
+      const resolvedPath = path.resolve(root, relativePath);
+      const resolvedRoot = path.resolve(root);
+      if (resolvedPath === resolvedRoot || !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+        return path.join(root, "__invalid_bundled_skill__");
+      }
+      return resolvedPath;
+    }
     if (skillPath.startsWith("~/")) {
       return path.join(os.homedir(), skillPath.slice(2));
     }
@@ -905,6 +943,14 @@ ${agentInstructions}
     try {
       const skillMd = fs.readFileSync(skillPath, "utf8");
       const parsed = matter(skillMd);
+      const metadata = parsed.data.metadata;
+      const allowImplicitInvocation =
+        metadata &&
+        typeof metadata === "object" &&
+        !Array.isArray(metadata) &&
+        (metadata as Record<string, unknown>)["allow-implicit-invocation"] === false
+          ? false
+          : undefined;
       return {
         name:
           typeof parsed.data.name === "string" && parsed.data.name.trim()
@@ -912,6 +958,7 @@ ${agentInstructions}
             : fallbackSkill.name,
         path: displayPath,
         description: typeof parsed.data.description === "string" ? parsed.data.description.trim() : "",
+        allowImplicitInvocation,
       };
     } catch {
       return fallbackSkill;
@@ -988,6 +1035,25 @@ ${agentInstructions}
         isLoaded: Boolean(matchedSkill.isLoaded || skill.isLoaded),
       };
     });
+  }
+
+  private appendSkillMessages(sessionId: string, skills?: SkillInfo[]): void {
+    if (!skills || skills.length === 0) {
+      return;
+    }
+
+    for (const skill of skills) {
+      if (skill.name === "plan") {
+        this.appendSessionMessage(sessionId, this.buildSystemMessage(sessionId, PLAN_MODE_STATUS_MESSAGE));
+      }
+      if (skill.isLoaded) {
+        continue;
+      }
+      const skillPrompt = this.buildSkillPrompt(skill);
+      const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
+      this.appendSessionMessage(sessionId, skillMessage);
+      this.onAssistantMessage(skillMessage, true);
+    }
   }
 
   getActiveSessionId(): string | null {
@@ -1113,17 +1179,7 @@ ${agentInstructions}
     userPrompt.skills = await this.normalizeSkills(userPrompt.skills);
     this.throwIfAborted(signal);
 
-    if (userPrompt.skills && userPrompt.skills.length > 0) {
-      for (const skill of userPrompt.skills) {
-        if (skill.isLoaded) {
-          continue;
-        }
-        const skillPrompt = this.buildSkillPrompt(skill);
-        const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
-        this.appendSessionMessage(sessionId, skillMessage);
-        this.onAssistantMessage(skillMessage, true);
-      }
-    }
+    this.appendSkillMessages(sessionId, userPrompt.skills);
 
     this.activeSessionId = sessionId;
     await this.activateSession(sessionId, controller);
@@ -1188,17 +1244,7 @@ ${agentInstructions}
     userPrompt.skills = await this.normalizeSkills(userPrompt.skills, sessionId);
     this.throwIfAborted(signal);
 
-    if (userPrompt.skills && userPrompt.skills.length > 0) {
-      for (const skill of userPrompt.skills) {
-        if (skill.isLoaded) {
-          continue;
-        }
-        const skillPrompt = this.buildSkillPrompt(skill);
-        const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
-        this.appendSessionMessage(sessionId, skillMessage);
-        this.onAssistantMessage(skillMessage, true);
-      }
-    }
+    this.appendSkillMessages(sessionId, userPrompt.skills);
     this.activeSessionId = sessionId;
     await this.activateSession(sessionId, controller);
   }
@@ -2340,17 +2386,7 @@ ${agentInstructions}
     }
     userPrompt.skills = await this.normalizeSkills(userPrompt.skills, sessionId);
     this.throwIfAborted(signal);
-    if (userPrompt.skills && userPrompt.skills.length > 0) {
-      for (const skill of userPrompt.skills) {
-        if (skill.isLoaded) {
-          continue;
-        }
-        const skillPrompt = this.buildSkillPrompt(skill);
-        const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
-        this.appendSessionMessage(sessionId, skillMessage);
-        this.onAssistantMessage(skillMessage, true);
-      }
-    }
+    this.appendSkillMessages(sessionId, userPrompt.skills);
   }
 
   private buildToolParamsSnippet(toolFunction: unknown | null): string {
